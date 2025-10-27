@@ -1,0 +1,23 @@
+# Database Configuration
+MONGODB_URL=mongodb://localhost:27017
+DATABASE_NAME=ai_app
+
+# OpenAI API Configuration
+OPENAI_API_KEY=your_openai_api_key_here
+# Get your API key from: https://platform.openai.com/api-keys
+
+# JWT Configuration
+JWT_SECRET_KEY=your_secret_key_here_change_in_production_use_strong_random_key
+JWT_ALGORITHM=HS256
+JWT_EXPIRATION_HOURS=24
+
+# Server Configuration
+HOST=0.0.0.0
+PORT=8000
+CORS_ORIGINS=http://localhost:3000
+
+# RAG Configuration
+VECTOR_DB_PATH=./vector_store
+EMBEDDING_MODEL=text-embedding-3-small
+
+
