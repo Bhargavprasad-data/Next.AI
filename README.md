@@ -1,4 +1,4 @@
-# AI Studio — Static Site Scaffold
+# Next.AI — Static Site Scaffold
 
 This is a minimal, accessible static website scaffold. It includes a simple responsive layout, semantic HTML, and light JavaScript for small enhancements.
 
