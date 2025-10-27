@@ -1,0 +1,11 @@
+API key updated successfully!
+
+Your new API key has been configured in env.txt file.
+
+To apply the changes:
+1. Restart the backend server (Ctrl+C then python main.py)
+2. The new API key will be loaded automatically
+
+Note: The .env file is created from env.txt
+
+
