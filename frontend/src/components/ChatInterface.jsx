@@ -27,8 +27,10 @@ import {
   AttachFile as AttachFileIcon,
   Image as ImageIcon,
   Close as CloseIcon,
+  Mic as MicIcon,
+  MicOff as MicOffIcon,
 } from '@mui/icons-material';
-import { chatService } from '../services/api';
+import { chatService, imageService, pptService, API_URL } from '../services/api';
 import MessageBubble from './MessageBubble';
 import RobotIcon from './RobotIcon';
 
@@ -44,6 +46,11 @@ function ChatInterface({ user, onLogout }) {
   const [uploadedFiles, setUploadedFiles] = useState([]);
   const [isUploading, setIsUploading] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState(null);
+  const [imageGenerating, setImageGenerating] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const recognitionRef = useRef(null);
+  const baseInputRef = useRef('');
+  const [liveTranscript, setLiveTranscript] = useState('');
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
 
@@ -330,6 +337,80 @@ function ChatInterface({ user, onLogout }) {
     }
   };
 
+  // Voice input using Web Speech API
+  const initRecognition = () => {
+    if (recognitionRef.current) return recognitionRef.current;
+    const SpeechRecognition =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      console.warn('SpeechRecognition not supported in this browser.');
+      return null;
+    }
+    const recog = new SpeechRecognition();
+    recog.lang = 'en-US';
+    recog.interimResults = true;
+    recog.continuous = true;
+    recog.onresult = (event) => {
+      // Use baseInput + final segments + interim tail to avoid duplication
+      let finalSegments = '';
+      let interimTail = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const res = event.results[i];
+        const text = res[0]?.transcript || '';
+        if (res.isFinal) {
+          finalSegments += text + ' ';
+        } else {
+          interimTail = text; // keep only the latest interim
+        }
+      }
+      if (finalSegments) {
+        baseInputRef.current = (baseInputRef.current + ' ' + finalSegments).trim();
+        setLiveTranscript('');
+      } else if (interimTail) {
+        setLiveTranscript(interimTail);
+      }
+      const merged = [baseInputRef.current, liveTranscript || interimTail].filter(Boolean).join(' ').trim();
+      setInput(merged);
+    };
+    recog.onerror = () => {
+      setIsRecording(false);
+      // finalize any interim text into base
+      if (liveTranscript) {
+        baseInputRef.current = (baseInputRef.current + ' ' + liveTranscript).trim();
+        setLiveTranscript('');
+        setInput(baseInputRef.current);
+      }
+    };
+    recog.onend = () => {
+      setIsRecording(false);
+      // commit remaining interim
+      if (liveTranscript) {
+        baseInputRef.current = (baseInputRef.current + ' ' + liveTranscript).trim();
+        setLiveTranscript('');
+        setInput(baseInputRef.current);
+      }
+    };
+    recognitionRef.current = recog;
+    return recog;
+  };
+
+  const toggleRecording = () => {
+    const recog = initRecognition();
+    if (!recog) return;
+    if (isRecording) {
+      try { recog.stop(); } catch {}
+      setIsRecording(false);
+    } else {
+      try {
+        // snapshot current input as base and clear live interim
+        baseInputRef.current = (input || '').trim();
+        setLiveTranscript('');
+        recog.start();
+        setIsRecording(true);
+      } catch {}
+    }
+  };
+
   const removeUploadedFile = (fileId) => {
     setUploadedFiles(prev => prev.filter(file => file.id !== fileId));
   };
@@ -358,6 +439,141 @@ function ChatInterface({ user, onLogout }) {
     setMessages((prev) => [...prev, newUserMessage]);
 
     try {
+      // If user requests image generation via "/image <prompt>"
+      if (userMessage.toLowerCase().startsWith('/image ')) {
+        const prompt = userMessage.slice(7).trim();
+        if (!prompt) throw new Error('Please provide a prompt after /image');
+
+        // Call image generation API
+        setImageGenerating(true);
+        const img = await imageService.generate(prompt);
+        const dataUrl = `data:image/png;base64,${img.image_base64}`;
+
+        const imageAssistantMessage = {
+          content: `![Generated image](${dataUrl})`,
+          role: 'assistant',
+          created_at: new Date(),
+        };
+        setMessages((prev) => [...prev, imageAssistantMessage]);
+
+        // Keep conversation mechanics minimal; do not update context id here
+        setUploadedFiles([]);
+
+        setTimeout(async () => {
+          await loadConversations();
+        }, 500);
+        setImageGenerating(false);
+        return;
+      }
+
+      // Heuristic: Natural-language image requests without the /image command
+      const lower = userMessage.toLowerCase();
+      const asksForImage = /(generate|create|make|draw|produce|show|give|build).*\b(image|picture|photo|pic)\b/.test(lower)
+        || /\b(image|picture|photo|pic)\b.*(of|about)/.test(lower)
+        || lower.endsWith(' image?')
+        || lower.endsWith(' picture?');
+      if (asksForImage) {
+        const prompt = userMessage.replace(/^\s*(generate|create|make|draw|produce|show|give|build)\s+(an?\s+)?(image|picture|photo|pic)\s*(of|about)?\s*/i, '').trim() || userMessage;
+        setImageGenerating(true);
+        const img = await imageService.generate(prompt);
+        const dataUrl = `data:image/png;base64,${img.image_base64}`;
+
+        const imageAssistantMessage = {
+          content: `![Generated image](${dataUrl})`,
+          role: 'assistant',
+          created_at: new Date(),
+        };
+        setMessages((prev) => [...prev, imageAssistantMessage]);
+        setUploadedFiles([]);
+        setTimeout(async () => { await loadConversations(); }, 500);
+        setImageGenerating(false);
+        return;
+      }
+
+      // Heuristic: Natural-language PPT requests (expanded)
+      const pptLower = userMessage.toLowerCase();
+      // Add fuzzy match for link typos like 'like' in addition to 'link'
+      const downloadLike = /download\s+(link|like|lik|lnk)/.test(pptLower);
+      const mentionsPpt = (
+        /(prepare|create|make|generate|build|draft|produce|export|save|get)\s+(a\s+)?(ppt|powerpoint|presentation|slide(s)?)\b/.test(pptLower)
+        || /(ppt|powerpoint|presentation|slides)\b.*(on|about|for|regarding)/.test(pptLower)
+        || /give\s+me\s+(a\s+)?(ppt|powerpoint|presentation|slide(s)?)/.test(pptLower)
+        || /presentation\s+(on|about|regarding)/.test(pptLower)
+        || /make\s+(slides?|ppt|powerpoint|presentation)/.test(pptLower)
+        || /generate\s+(slides?|ppt|powerpoint|presentation)/.test(pptLower)
+        || /slides?\s+(about|for|on)/.test(pptLower)
+        || /create\s+(ppt|powerpoint|presentation|slides?)/.test(pptLower)
+        || /export\s+(to\s+)?(ppt|powerpoint|presentation)/.test(pptLower)
+        || /save\s+(as\s+)?(ppt|powerpoint|presentation)/.test(pptLower)
+        || /get\s+(the\s+)?(ppt|powerpoint|presentation|slides?)/.test(pptLower)
+      );
+      if (mentionsPpt || downloadLike) {
+        // Try to infer slide count like "10 slides" or "a 12-slide presentation"
+        let slideCount = 14;
+        const slideMatch = userMessage.match(/(\b|\D)(\d{1,2})\s*-?\s*slide(s)?\b/i);
+        if (slideMatch) {
+          slideCount = Math.max(3, Math.min(parseInt(slideMatch[2], 10), 20));
+        }
+        // Remove common phrases to isolate topic
+        let topic = userMessage
+          .replace(/\b(provide|give)\s+(me\s+)?(a\s+)?(download\s+)?(link|like|lik|lnk)\b/gi, '')
+          .replace(/\blink\s+to\s+download\b/gi, '')
+          .replace(/^((please\s+)?(prepare|create|make|generate|build|draft|produce|export|save|get))\s+(a\s+)?(ppt|powerpoint|presentation|slide(s)?)\s*(on|about|for|regarding)?\s*/i, '')
+          .replace(/(download|get|save|export)\s+(the\s+)?(ppt|powerpoint|presentation|slides?( |$|\.))/gi, '')
+          .replace(/(download|get|save|export)\s+(a\s+)?(ppt|powerpoint|presentation|slides?)/gi, '')
+          .replace(/\s*download\s+(link|like|lik|lnk)\s*/gi, '')
+          .trim();
+        if (!topic || topic.length < 3) topic = userMessage;
+
+        // First, get a detailed textual response
+        const ai = await chatService.sendMessageWithFiles(userMessage, fileInfo, currentConversationId);
+        // Then, generate the PPT and build a combined message with link at the bottom
+        const result = await pptService.generate(topic, slideCount, ai.response);
+        const link = `${API_URL}${result.url}`;
+        const combinedAssistantMessage = {
+          content: `${ai.response}\n\n[Download PPT](${link})`,
+          role: 'assistant',
+          created_at: new Date(),
+        };
+        setMessages((prev) => [...prev, combinedAssistantMessage]);
+        if (ai.context_id && !currentConversationId) {
+          setCurrentConversationId(ai.context_id);
+        }
+        setUploadedFiles([]);
+        setTimeout(async () => { await loadConversations(); }, 500);
+        return;
+      }
+
+      // If user requests PPT generation via "/ppt <prompt>" (optional: count like "/ppt 10: topic")
+      if (userMessage.toLowerCase().startsWith('/ppt ')) {
+        const raw = userMessage.slice(5).trim();
+        let slideCount = 14;
+        let prompt = raw;
+        const countMatch = raw.match(/^(\d{1,2})\s*:\s*(.*)$/);
+        if (countMatch) {
+          slideCount = parseInt(countMatch[1], 10);
+          prompt = countMatch[2];
+        }
+        if (!prompt) throw new Error('Please provide a prompt after /ppt');
+
+        // Provide helpful text plus link
+        const ai = await chatService.sendMessageWithFiles(userMessage, fileInfo, currentConversationId);
+        const result = await pptService.generate(prompt, slideCount, ai.response);
+        const link = `${API_URL}${result.url}`;
+        const combinedAssistantMessage = {
+          content: `${ai.response}\n\n[Download PPT](${link})`,
+          role: 'assistant',
+          created_at: new Date(),
+        };
+        setMessages((prev) => [...prev, combinedAssistantMessage]);
+        if (ai.context_id && !currentConversationId) {
+          setCurrentConversationId(ai.context_id);
+        }
+        setUploadedFiles([]);
+        setTimeout(async () => { await loadConversations(); }, 500);
+        return;
+      }
+
       const response = await chatService.sendMessageWithFiles(userMessage, fileInfo, currentConversationId);
       
       const newAssistantMessage = {
@@ -381,6 +597,8 @@ function ChatInterface({ user, onLogout }) {
       }, 1000);
     } catch (error) {
       console.error('Error sending message with files:', error);
+      // Ensure image indicator resets on errors
+      try { setImageGenerating(false); } catch {}
       const errorMessage = {
         content: 'Sorry, I encountered an error processing your files. Please try again.',
         role: 'assistant',
@@ -390,6 +608,8 @@ function ChatInterface({ user, onLogout }) {
       setMessages((prev) => [...prev, errorMessage]);
     } finally {
       setLoading(false);
+      // Safety: reset image indicator
+      try { setImageGenerating(false); } catch {}
     }
   };
 
@@ -733,7 +953,7 @@ function ChatInterface({ user, onLogout }) {
               >
                 <CircularProgress size={24} />
                 <Typography variant="body2" sx={{ color: '#8e8ea0' }}>
-                  Next.AI is thinking...
+                  {imageGenerating ? 'Generating image...' : 'Next.AI is thinking...'}
                 </Typography>
               </Box>
             </Grow>
@@ -816,11 +1036,26 @@ function ChatInterface({ user, onLogout }) {
               <AttachFileIcon />
             </IconButton>
 
+            {/* Image/PPT generation handled via /image and /ppt commands */}
+
+            {/* Microphone */}
+            <IconButton
+              onClick={toggleRecording}
+              disabled={loading || isUploading}
+              sx={{
+                color: isRecording ? '#e74c3c' : '#8e8ea0',
+                '&:hover': { color: isRecording ? '#c0392b' : '#6A6ADF' },
+                '&:disabled': { color: 'rgba(255, 255, 255, 0.3)' },
+              }}
+            >
+              {isRecording ? <MicOffIcon /> : <MicIcon />}
+            </IconButton>
+
             <TextField
               fullWidth
               multiline
               maxRows={4}
-              placeholder="Ask Next.AI... (or upload files)"
+              placeholder="Ask Next.AI... Type /image <prompt> or /ppt [n: ]<topic> (or upload files)"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
@@ -868,6 +1103,8 @@ function ChatInterface({ user, onLogout }) {
             </IconButton>
           </Box>
         </Box>
+
+        {/* Image and PPT dialogs removed - use slash commands instead */}
       </Box>
     </Box>
   );
