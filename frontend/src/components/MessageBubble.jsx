@@ -30,6 +30,7 @@ function MessageBubble({ message, onEditMessage, isProcessingEdit = false }) {
       onEditMessage(message, editText.trim());
     }
     setIsEditing(false);
+    // Optionally signal parent to clear editingMessageId if needed (parent clean-up)
   };
 
   const handleCancelEdit = () => {
@@ -345,6 +346,69 @@ function MessageBubble({ message, onEditMessage, isProcessingEdit = false }) {
                   }}
                 >
                   {children}
+                </Box>
+              ),
+              table: ({ children }) => (
+                <Box
+                  component="table"
+                  sx={{
+                    width: '100%',
+                    borderCollapse: 'collapse',
+                    mb: 2,
+                    backgroundColor: 'rgba(255,255,255,0.04)',
+                    borderRadius: 1,
+                    overflow: 'hidden',
+                  }}
+                >
+                  {children}
+                </Box>
+              ),
+              thead: ({ children }) => (
+                <Box component="thead" sx={{ backgroundColor: 'rgba(106,106,223,0.14)' }}>
+                  {children}
+                </Box>
+              ),
+              tbody: ({ children }) => <Box component="tbody">{children}</Box>,
+              tr: ({ children }) => (
+                <Box
+                  component="tr"
+                  sx={{
+                    borderBottom: '1px solid #555',
+                    '&:last-child': {
+                      borderBottom: 'none',
+                    },
+                  }}
+                >
+                  {children}
+                </Box>
+              ),
+              th: ({ children }) => (
+                <Box
+                  component="th"
+                  sx={{
+                    p: 1.2,
+                    border: '1px solid #6167a1',
+                    backgroundColor: 'rgba(106,106,223,0.15)',
+                    color: '#fafaff',
+                    fontWeight: 700,
+                    textAlign: 'left',
+                    fontSize: '1rem',
+                  }}
+                >
+                  <Typography variant="subtitle2" sx={{ fontWeight: 800, color: '#fafaff', fontSize: 'inherit' }}>{children}</Typography>
+                </Box>
+              ),
+              td: ({ children }) => (
+                <Box
+                  component="td"
+                  sx={{
+                    p: 1.2,
+                    border: '1px solid #444',
+                    color: '#fff',
+                    fontSize: '0.98rem',
+                  }}
+                >
+                  <Typography variant="body2" sx={{ color: '#fff', fontSize: 'inherit' }}>{children}</Typography>
                 </Box>
               ),
             }}
