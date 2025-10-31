@@ -207,7 +207,6 @@ async def generate_with_rag(
     conversation_history: list = None
 ) -> str:
     """Generate response using RAG with Gemini as primary and OpenAI as fallback"""
-    
     # Check if this is a real-time query
     is_realtime = await detect_realtime_query(query)
     
@@ -240,8 +239,8 @@ User Query: {query}
     
     # Add current user message
     messages.append({"role": "user", "content": user_prompt})
-    
-    # Try Gemini first since it's working
+
+    # Try Gemini first
     if GEMINI_AVAILABLE and settings.gemini_api_key:
         try:
             print("Using Gemini as primary AI service...")
@@ -265,11 +264,10 @@ User Query: {query}
             )
             print("Gemini response successful!")
             return response.text
-            
         except Exception as gemini_error:
             print(f"Gemini failed: {gemini_error}")
             # Fall back to OpenAI
-    
+
     # Try OpenAI as fallback
     try:
         print("Falling back to OpenAI...")
