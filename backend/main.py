@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request, status, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from config import settings
 from database import connect_to_mongo, close_mongo_connection, get_database, ping
@@ -18,6 +19,9 @@ from auth import create_access_token, verify_password, get_password_hash
 from middleware import get_current_user, get_optional_user
 from rag import generate_with_rag
 from file_processor import FileProcessor
+from pydantic import BaseModel
+import re
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -59,6 +63,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Serve generated files (PPTs, etc.)
+import os
+GENERATED_DIR = os.path.join(os.path.dirname(__file__), "generated")
+os.makedirs(GENERATED_DIR, exist_ok=True)
+app.mount("/static", StaticFiles(directory=GENERATED_DIR), name="static")
 
 
 # Error handlers
@@ -175,20 +185,12 @@ async def chat(
         else:
             conversation_id = request.context_id
         
-        # Save user message
-        user_message = {
-            "user_id": current_user["_id"],
-            "content": request.message,
-            "role": "user",
-            "created_at": datetime.utcnow(),
-            "conversation_id": conversation_id
-        }
-        msg_result = await db.messages.insert_one(user_message)
-        
-        # Generate AI response
+        # Ensure system_prompt is always defined
         system_prompt = """You are an advanced AI assistant similar to ChatGPT and Gemini. You are highly intelligent, knowledgeable, and capable of providing comprehensive, detailed, and helpful responses to any question or request.
 
 CRITICAL INSTRUCTION: When users ask questions, NEVER start your response with disclaimers like "I can't provide", "I don't have access", "While I can't", etc. Instead, directly answer the question with the information you know. Users want helpful answers, not warnings about limitations. Be direct and informative.
+
+For questions about real-time or rapidly changing information (like temperature, news, financial figures, weather, etc), NEVER say any form of 'I can't provide' or 'I don't have access.' INSTEAD, provide the most probable, last-known, estimated, or typical information, clearly noting if it may be out of date. Suggest to the user how they can get truly live data (e.g., name a reputable website or app), but ALWAYS give an answer based on your available knowledge.
 
 Your capabilities include:
 - Answering questions across all domains (science, technology, history, arts, etc.)
@@ -222,6 +224,13 @@ STRUCTURE AND DELIVERY:
 6. Suggest reliable sources for verification (official websites, Wikipedia, or reputable news organizations).
 7. Keep the tone professional but readable, friendly if needed.
 
+When a table is needed in your response:
+- Use correct Markdown table format. Each row must start and end with a single |, the header separator should appear only once directly after the header, and every row must have the same number of columns as the header. Do not output extra pipes, repeated header lines, or malformed Markdown tables.
+
+When a user asks for a summary that includes both anatomical structures and physiological functions (or other logically separate categories), NEVER combine unrelated items into a single table. INSTEAD, output multiple clearly-separated Markdown tables—one for each logical category (example: one table for anatomical components, another for key kidney functions). Each table must have an appropriate header, exactly matching the columns to the content type.
+
+If the user's message is unclear, ambiguous, or could benefit from more information, immediately reply with a polite, explicit CLARIFYING QUESTION before attempting to answer. Wait for the user's reply before providing a solution or information.
+
 For questions about people, health, or personal matters:
 - When asked about public figures, politicians, celebrities, or well-known individuals, provide information based on publicly available knowledge WITHOUT giving disclaimers
 - For questions about someone's health or personal status, provide general information from public sources you have knowledge of
@@ -241,6 +250,31 @@ For real-time information requests:
 
 Remember: Your goal is to be as helpful and comprehensive as ChatGPT or Gemini. Always provide detailed, accurate, and engaging responses that fully address user questions. NEVER start responses with disclaimers like "I can't provide" or "I don't have access" - instead, just provide the helpful information directly. Users want answers, not warnings about limitations. Be direct, helpful, and informative."""
         
+        # Save user message
+        user_message = {
+            "user_id": current_user["_id"],
+            "content": request.message,
+            "role": "user",
+            "created_at": datetime.utcnow(),
+            "conversation_id": conversation_id
+        }
+        msg_result = await db.messages.insert_one(user_message)
+        
+        # Check for weather/temperature queries
+        weather_pat = re.compile(r'(?:current \s*)?(?:temperature|weather)(?:\s*in)?\s*([a-zA-Z\s]+)', re.IGNORECASE)
+        weather_match = weather_pat.search(request.message)
+        weather_override = None
+        if weather_match and settings.openweathermap_api_key and len(settings.openweathermap_api_key) > 5:
+            loc = weather_match.group(1).strip()
+            result = fetch_current_weather(loc, api_key=settings.openweathermap_api_key)
+            if result:
+                temp = result["temp"]
+                desc = result["desc"]
+                weather_override = f"[Real-time data] The current weather in {result['city']} is {desc}, temperature: {temp}°C. "
+        
+        # Compose prompt for LLM
+        user_prompt = ((weather_override or "") + request.message).strip()
+        
         logger.info(f"Generating AI response for user message: {request.message[:100]}...")
         
         # Get recent conversation history for context
@@ -257,7 +291,7 @@ Remember: Your goal is to be as helpful and comprehensive as ChatGPT or Gemini. 
                 "content": msg.get("content", "")
             })
         
-        ai_response = await generate_with_rag(request.message, system_prompt, conversation_history)
+        ai_response = await generate_with_rag(user_prompt, system_prompt, conversation_history)
         logger.info(f"AI response generated successfully: {ai_response[:100]}...")
         
         # Save AI response
@@ -568,6 +602,48 @@ async def chat_with_files(
 
 CRITICAL INSTRUCTION: When users ask questions, NEVER start your response with disclaimers like "I can't provide", "I don't have access", "While I can't", etc. Instead, directly answer the question with the information you know. Users want helpful answers, not warnings about limitations. Be direct and informative.
 
+For questions about real-time or rapidly changing information (like temperature, news, financial figures, weather, etc), NEVER say any form of 'I can't provide' or 'I don't have access.' INSTEAD, provide the most probable, last-known, estimated, or typical information, clearly noting if it may be out of date. Suggest to the user how they can get truly live data (e.g., name a reputable website or app), but ALWAYS give an answer based on your available knowledge.
+
+1. Academic and Educational:
+    - Math problems (algebra, geometry, calculus, etc.)
+    - Science (physics, chemistry, biology, etc.)
+    - History, geography, literature, humanities
+    - Programming and computer science
+2. Technology and Computing:
+    - Software/apps use
+    - Troubleshooting technical issues
+    - Programming/coding (all languages)
+    - Gadgets, AI, technology news
+3. General Knowledge:
+    - Historical events
+    - Science and technology explanations
+    - Culture, arts, entertainment
+    - Sports, news, current events
+4. Language and Grammar:
+    - Grammar, word meanings, syntax
+    - Translation and interpretation
+5. Career and Professional:
+    - Resume, job search, interview questions
+    - Career advice, industry insights
+6. Personal and Lifestyle:
+    - Health, wellness, counseling
+    - Travel, productivity, time management
+    - Relationships and self-improvement
+7. Business and Entrepreneurship:
+    - Marketing, sales, finance, management
+    - Business planning and entrepreneurship
+8. Love, Relationships, and More:
+    - Friendship, emotional well-being, self-care
+    - Growth & development, parenting
+    - Communication, conflict, dating, romance, mental health
+
+INSTRUCTIONS:
+- ALWAYS answer questions in these domains directly, comprehensively, and with clear, structured explanations as needed
+- Give step-by-step help for math and science, code with explanations for programming, practical and empathetic advice for personal and career issues
+- DO NOT ever refuse to answer unless prohibited by law or safety
+- When a question could fit several domains, break down the answer by relevant category
+- Users expect answers in any of these categories; you must provide them
+
 Your file analysis capabilities:
 - **Images**: Detailed visual analysis, object identification, text extraction, color analysis, composition assessment
 - **Documents (PDF, Word, etc.)**: Complete content extraction, key point summarization, theme analysis, structure breakdown
@@ -612,6 +688,13 @@ STRUCTURE AND DELIVERY:
 6. Suggest reliable sources for verification (official websites, Wikipedia, or reputable news organizations).
 7. Keep the tone professional but readable, friendly if needed.
 
+When a table is needed in your response:
+- Use correct Markdown table format. Each row must start and end with a single |, the header separator should appear only once directly after the header, and every row must have the same number of columns as the header. Do not output extra pipes, repeated header lines, or malformed Markdown tables.
+
+When a user asks for a summary that includes both anatomical structures and physiological functions (or other logically separate categories), NEVER combine unrelated items into a single table. INSTEAD, output multiple clearly-separated Markdown tables—one for each logical category (example: one table for anatomical components, another for key kidney functions). Each table must have an appropriate header, exactly matching the columns to the content type.
+
+If the user's message is unclear, ambiguous, or could benefit from more information, immediately reply with a polite, explicit CLARIFYING QUESTION before attempting to answer. Wait for the user's reply before providing a solution or information.
+
 Remember: Provide analysis and answers that match the quality and depth of ChatGPT and Gemini. Always prioritize ACCURACY and FACTUAL CORRECTNESS. NEVER start responses with disclaimers or warnings. Just provide helpful, direct answers based on the information you have. Users want information, not apologies about what you can't do."""
         
         # Get recent conversation history for context
@@ -654,6 +737,421 @@ Remember: Provide analysis and answers that match the quality and depth of ChatG
         )
 
 
+# Image generation endpoint
+class ImageGenerateRequest(BaseModel):
+    prompt: str
+    size: str | None = "1024x1024"
+
+
+@app.post("/api/images/generate", tags=["AI"])
+async def generate_image(
+    request: ImageGenerateRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Generate an image from a text prompt using OpenAI DALL·E first (fallback to Gemini). Returns base64 image data for inline rendering."""
+    size = request.size or "1024x1024"
+    allowed_oai_sizes = ["1024x1024", "1792x1024", "1024x1792"]
+    oai_size = size if size in allowed_oai_sizes else "1024x1024"
+
+    # Main logic: Try OpenAI first
+    from config import settings
+    b64 = None
+    used_provider = None
+    # Try OpenAI DALL·E
+    try:
+        if settings.openai_api_key and len(settings.openai_api_key) > 10:
+            try:
+                from openai import AsyncOpenAI
+                import aiohttp
+                oai = AsyncOpenAI(api_key=settings.openai_api_key)
+                res = await oai.images.generate(
+                    model="dall-e-3",
+                    prompt=request.prompt,
+                    n=1,
+                    size=oai_size,
+                    quality="standard",
+                )
+                url = res.data[0].url
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as resp:
+                        img_bytes = await resp.read()
+                import base64
+                b64 = base64.b64encode(img_bytes).decode()
+                used_provider = "openai"
+            except Exception as oae:
+                import traceback
+                import sys
+                logger.error(f"OpenAI image error: {oae}")
+                logger.error(''.join(traceback.format_exception(*sys.exc_info())))
+                b64 = None
+                used_provider = None
+    except ImportError:
+        pass
+
+    # If OpenAI fails, fallback to Gemini
+    if not b64:
+        if not settings.gemini_api_key or len(settings.gemini_api_key) < 10:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="OPENAI_API_KEY and GEMINI_API_KEY not configured or not working. Set at least one in backend environment."
+            )
+        try:
+            import requests
+            width, height = 1024, 1024
+            try:
+                parts = (size or "1024x1024").lower().split("x")
+                if len(parts) == 2:
+                    width = int(parts[0]); height = int(parts[1])
+            except Exception:
+                pass
+            url = "https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0:generateImages"
+            params = {"key": settings.gemini_api_key}
+            payload = {
+                "prompt": {"text": request.prompt},
+                "numberOfImages": 1,
+                "width": width,
+                "height": height,
+            }
+            resp = requests.post(url, params=params, json=payload, timeout=60)
+            if resp.status_code >= 400:
+                logger.error(f"Gemini HTTP {resp.status_code}: {resp.text[:500]}")
+                raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:300]}")
+            data = resp.json()
+            images = data.get("images") or []
+            b64 = images and images[0].get("byteContent")
+            if not b64:
+                try:
+                    candidates = data.get("candidates") or []
+                    parts = ((candidates[0] or {}).get("content") or {}).get("parts") or []
+                    inline = (parts[0] or {}).get("inline_data") or {}
+                    b64 = inline.get("data")
+                except Exception:
+                    b64 = None
+            used_provider = "gemini"
+        except Exception as ge:
+            logger.error(f"Gemini image generation failed: {ge}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Gemini image generation failed: {str(ge)}"
+            )
+    if not b64:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Both OpenAI and Gemini image generation failed."
+        )
+    return {"image_base64": b64, "size": size, "provider": used_provider}
+
+
+class PptGenerateRequest(BaseModel):
+    prompt: str
+    slide_count: int | None = 14
+    outline_markdown: str | None = None  # Optional: user-provided outline/content to use directly
+
+
+@app.post("/api/ppt/generate", tags=["AI"])
+async def generate_ppt(
+    request: PptGenerateRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Generate a PPTX file based on user input and return a download URL."""
+    try:
+        # Create content outline using OpenAI for higher quality structure
+        from openai import AsyncOpenAI
+        import json
+        from datetime import datetime
+        from pptx import Presentation
+        from pptx.util import Inches, Pt
+
+        slide_count = max(3, min(int(request.slide_count or 14), 20))
+
+        outline_schema = (
+            "Return ONLY JSON with keys: title (string), subtitle (string, optional), slides (array of objects). "
+            "Each slide object must have: 'title' (string), 'bullets' (array of 3-8 strings), and optional 'notes' (string). "
+            f"Create about {slide_count} slides. Bullets should be specific, informative, 1 sentence each, with factual details when known. "
+            "Use strong structure: Title, Introduction, Background/History, Key Features/Points, Generations/Timeline (if applicable), Special Editions/Variants, Technology & Performance/Data, Cultural Impact/Market, Future/Next Steps, Summary/Conclusion, Q&A. "
+            "Avoid generic filler. Include references slide bullets if relevant."
+        )
+
+        outline_prompt = (
+            f"You are preparing a professional, detailed presentation.\n"
+            f"Topic: {request.prompt}\n"
+            f"All slides and bullets must focus ONLY on the topic: {request.prompt}. Slides MUST be deeply factual, detailed, and specifically about this topic — no generic templates or filler allowed. Do not include empty or unrelated bullets. Include authentic facts, numbers, history, news, descriptions, analysis, and examples. Never use placeholder content.\n"
+            f"{outline_schema}\n"
+            "Example minimal JSON format: {\"title\":\"...\",\"subtitle\":\"...\",\"slides\":[{\"title\":\"...\",\"bullets\":[\"...\",\"...\"],\"notes\":\"...\"}]}"
+        )
+
+        outline = {
+            "title": "Presentation",
+            "slides": []
+        }
+
+        def parse_outline_markdown(md_text: str) -> dict:
+            """Parse a simple outline-like text into our outline dict.
+            Supports blocks that look like 'Slide N: Title' and bullet lists under 'Content:'
+            or generic headings and '-' bullets. Best-effort; falls back if parsing yields no slides.
+            """
+            title = request.prompt[:80] if request.prompt else "Presentation"
+            subtitle: str | None = None
+            slides: list[dict] = []
+            if not md_text:
+                return {"title": title, "subtitle": subtitle, "slides": slides}
+            lines = [l.rstrip() for l in md_text.splitlines()]
+            current: dict | None = None
+            in_content = False
+            for raw in lines:
+                line = raw.strip()
+                if not line:
+                    in_content = False
+                    continue
+                # Global title/subtitle at document top
+                if not slides and not current and line.lower().startswith("title:"):
+                    maybe_title = line.split(":",1)[1].strip()
+                    if maybe_title:
+                        title = maybe_title
+                    continue
+                if not slides and not current and line.lower().startswith("subtitle:"):
+                    maybe_sub = line.split(":",1)[1].strip()
+                    if maybe_sub:
+                        subtitle = maybe_sub
+                    continue
+                # Detect a new slide header
+                if line.lower().startswith("slide "):
+                    # Commit previous slide
+                    if current:
+                        if current.get("bullets"):
+                            slides.append(current)
+                    # Extract title after ':' if present
+                    slide_title = line.split(":", 1)[1].strip() if ":" in line else line
+                    current = {"title": slide_title or "Slide", "bullets": []}
+                    in_content = False
+                    continue
+                # Detect Title: ... within a slide
+                if line.lower().startswith("title:"):
+                    if not current:
+                        current = {"title": line.split(":",1)[1].strip() or "Slide", "bullets": []}
+                    else:
+                        current["title"] = line.split(":",1)[1].strip() or current.get("title") or "Slide"
+                    in_content = False
+                    continue
+                # Detect Image: ... add as a bullet annotation
+                if line.lower().startswith("image:"):
+                    if not current:
+                        current = {"title": "Slide", "bullets": []}
+                    desc = line.split(":",1)[1].strip()
+                    if desc:
+                        current.setdefault("bullets", []).append(f"Image: {desc}")
+                    continue
+                # Detect Content: section
+                if line.lower().startswith("content:"):
+                    in_content = True
+                    continue
+                # Bullet via dash or asterisk
+                if line.startswith("-") or line.startswith("*"):
+                    if not current:
+                        current = {"title": "Slide", "bullets": []}
+                    bullet = line.lstrip("-* ").strip()
+                    if bullet:
+                        current.setdefault("bullets", []).append(bullet)
+                    continue
+                # Within a Content: section, treat plain lines as bullets
+                if in_content:
+                    if not current:
+                        current = {"title": "Slide", "bullets": []}
+                    current.setdefault("bullets", []).append(line)
+                    continue
+                # Heading: ... map as title if no current
+                if line.lower().startswith("heading:"):
+                    if current and current.get("bullets"):
+                        slides.append(current)
+                    current = {"title": line.split(":",1)[1].strip() or "Slide", "bullets": []}
+                    continue
+            # Commit last
+            if current and current.get("bullets"):
+                slides.append(current)
+            return {"title": title, "subtitle": subtitle, "slides": slides}
+
+        if request.outline_markdown:
+            parsed = parse_outline_markdown(request.outline_markdown)
+            if parsed.get("slides"):
+                outline = parsed
+        elif settings.openai_api_key:
+            try:
+                client = AsyncOpenAI(api_key=settings.openai_api_key)
+                completion = await client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "You create structured presentation outlines as strict JSON only."},
+                        {"role": "user", "content": outline_prompt},
+                    ],
+                    temperature=0.4,
+                )
+                text = completion.choices[0].message.content
+                # Extract JSON if wrapped in code fences
+                if "{" in text:
+                    json_str = text[text.find("{") : text.rfind("}") + 1]
+                    outline = json.loads(json_str)
+            except Exception as e:
+                logger.warning(f"Outline generation failed, falling back: {e}")
+
+        # Fallback detailed outline if needed or too short
+        slides = outline.get("slides") or []
+        if len(slides) < max(8, slide_count - 2):
+            topic = request.prompt
+            base_title = (outline.get("title") or topic or "Presentation")[:80]
+            detailed_titles = [
+                "Introduction",
+                "Origins and Vision",
+                "First Generation (1964–1973)",
+                "Second Generation (1974–1978)",
+                "Third Generation (1979–1993)",
+                "Fourth Generation (1994–2004)",
+                "Fifth Generation (2005–2014)",
+                "Sixth Generation (2015–2023)",
+                "Seventh Generation (2024–Present)",
+                "Special Editions & Racing Heritage",
+                "Technology & Performance",
+                "Cultural Impact",
+                "Future Outlook",
+                "Conclusion & Q&A",
+            ]
+            fallback_slides = []
+            for t in detailed_titles[:slide_count]:
+                if t == "Introduction":
+                    bullets = [
+                        f"Overview of {topic} and why it matters.",
+                        "Key characteristics and enduring appeal.",
+                        "Context for the discussion and desired outcomes.",
+                    ]
+                elif t == "Origins and Vision":
+                    bullets = [
+                        "Foundational goals, design philosophy, and target audience.",
+                        "Market conditions and influences at inception.",
+                        "Early milestones and launch context.",
+                    ]
+                elif "First Generation" in t:
+                    bullets = [
+                        "Design language: long hood, short deck; multiple body styles.",
+                        "Powertrains across trims; growing performance variants.",
+                        "Market impact and cultural footprint in the late 1960s.",
+                    ]
+                elif "Second Generation" in t:
+                    bullets = [
+                        "Downsizing response to fuel crisis and regulations.",
+                        "Platform shift and engineering trade-offs.",
+                        "Reception, sales performance, and lessons learned.",
+                    ]
+                elif "Third Generation" in t:
+                    bullets = [
+                        "Platform change enabling lighter, more aerodynamic designs.",
+                        "Return of performance variants and aftermarket ecosystem.",
+                        "Longest-running generation and enthusiast following.",
+                    ]
+                elif "Fourth Generation" in t:
+                    bullets = [
+                        "Modernization with retro cues and improved refinement.",
+                        "Powertrain evolution and chassis handling gains.",
+                        "Notable special editions and design refresh.",
+                    ]
+                elif "Fifth Generation" in t:
+                    bullets = [
+                        "Retro-futurist styling revisiting classic proportions.",
+                        "Technology and safety upgrades; interior improvements.",
+                        "High-performance models and motorsport relevance.",
+                    ]
+                elif "Sixth Generation" in t:
+                    bullets = [
+                        "Independent rear suspension and global platform strategy.",
+                        "Powertrain mix (including efficient turbo options).",
+                        "Advanced infotainment and driver-assist tech.",
+                    ]
+                elif "Seventh Generation" in t:
+                    bullets = [
+                        "Design evolution with digital cockpit and modern electronics.",
+                        "Performance focus with continued V8 availability (where applicable).",
+                        "Track-oriented variants and new features.",
+                    ]
+                elif "Special Editions" in t:
+                    bullets = [
+                        "Overview of halo models and heritage editions.",
+                        "Motorsport variants and competition successes.",
+                        "Community, clubs, and enthusiast culture.",
+                    ]
+                elif "Technology & Performance" in t:
+                    bullets = [
+                        "Chassis, suspension, and braking advancements.",
+                        "Powertrain innovations and performance metrics (where known).",
+                        "Weight, aerodynamics, and materials evolution.",
+                    ]
+                elif "Cultural Impact" in t:
+                    bullets = [
+                        "Appearances in media and popular culture.",
+                        "Design influence on competitors and the segment.",
+                        "Sales performance and brand perception over time.",
+                    ]
+                elif "Future Outlook" in t:
+                    bullets = [
+                        "Electrification and regulatory landscape.",
+                        "Technology roadmap and potential variants.",
+                        "Balancing heritage with innovation.",
+                    ]
+                else:
+                    bullets = [
+                        "Recap of key takeaways and highlights.",
+                        "Strategic implications and next steps.",
+                        "Q&A / Discussion.",
+                    ]
+                fallback_slides.append({"title": t, "bullets": bullets, "notes": ""})
+
+            outline = {"title": base_title, "subtitle": outline.get("subtitle") or "Generated by Next.AI", "slides": fallback_slides}
+
+        prs = Presentation()
+
+        # Title slide
+        title_layout = prs.slide_layouts[0]
+        slide = prs.slides.add_slide(title_layout)
+        slide.shapes.title.text = outline.get("title") or "Presentation"
+        subtitle_text = outline.get("subtitle") or "Generated by Next.AI"
+        if slide.placeholders and len(slide.placeholders) > 1:
+            slide.placeholders[1].text = subtitle_text
+
+        # Content slides
+        bullet_layout = prs.slide_layouts[1]
+        for s in outline.get("slides", [])[:slide_count]:
+            cs = prs.slides.add_slide(bullet_layout)
+            cs.shapes.title.text = s.get("title") or "Slide"
+            body = cs.shapes.placeholders[1].text_frame
+            body.clear()
+            bullets = s.get("bullets") or []
+            for i, b in enumerate(bullets[:12]):
+                if i == 0:
+                    body.text = b
+                else:
+                    p = body.add_paragraph()
+                    p.text = b
+                    p.level = 0
+            # Add speaker notes if provided
+            notes_text = s.get("notes")
+            if notes_text:
+                notes_slide = cs.notes_slide
+                notes_frame = notes_slide.notes_text_frame
+                notes_frame.text = notes_text
+
+        # Save file
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        safe_base = "presentation"
+        filename = f"{safe_base}_{timestamp}.pptx"
+        filepath = os.path.join(GENERATED_DIR, filename)
+        prs.save(filepath)
+
+        return {"filename": filename, "url": f"/static/{filename}"}
+    except Exception as e:
+        logger.error(f"Error generating PPT: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate PPT: {str(e)}"
+        )
+
+
 # Admin endpoints
 @app.post("/api/admin/add-documents", tags=["Admin"])
 async def add_documents(
@@ -677,6 +1175,24 @@ async def add_documents(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error adding documents"
         )
+
+
+def fetch_current_weather(city, country_code=None, api_key=None):
+    if not api_key:
+        return None
+    endpoint = "http://api.openweathermap.org/data/2.5/weather"
+    q = f"{city},{country_code}" if country_code else city
+    params = {"q": q, "appid": api_key, "units": "metric"}
+    try:
+        resp = requests.get(endpoint, params=params, timeout=6)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        temp = data['main']['temp']
+        desc = data['weather'][0]['description']
+        return {"temp": temp, "desc": desc, "city": city.title()}
+    except Exception:
+        return None
 
 
 if __name__ == "__main__":
