@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+export const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 const api = axios.create({
   baseURL: API_URL,
@@ -94,6 +94,20 @@ export const chatService = {
       context_id: contextId,
     });
     return response.data;
+  },
+};
+
+export const imageService = {
+  async generate(prompt, size = '1024x1024') {
+    const response = await api.post('/api/images/generate', { prompt, size });
+    return response.data;
+  },
+};
+
+export const pptService = {
+  async generate(prompt, slideCount = 8, outlineMarkdown = null) {
+    const response = await api.post('/api/ppt/generate', { prompt, slide_count: slideCount, outline_markdown: outlineMarkdown });
+    return response.data; // { filename, url }
   },
 };
 
